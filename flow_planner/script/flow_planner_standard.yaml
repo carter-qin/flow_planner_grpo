@@ -5,23 +5,29 @@ hydra:
     name: ${job_name}
 
 project_root: ${oc.env:PROJECT_ROOT}
-save_dir: ${oc.env:SAVE_DIR}/outputs/${project}/${job_name}/${now:%Y-%m-%d_%H-%M-%S}
+save_dir: ${oc.env:SAVE_DIR}/outputs/${project}/${job_name}
 save_every_since: 0
 resume_path: null
-pretrained_checkpoint: null
-project: FlowPlannerTraining
-job_name: flow_planner_standard
+should_resume: true
+pretrained_checkpoint: /root/data/Flow-Planner/work_dirs/outputs/pittsburgh/pittsburgh_run1/latest.pth
+
+# [修改 1] 项目名称
+project: pittsburgh_lora
+job_name: pittsburgh_run2
 logger_level: info
 seed: 3402
 device: cuda
-num_workers: 4
-use_wandb: false
+num_workers: 12
+use_wandb: true
 pin_mem: true
 
 train:
-  batch_size: 2048
-  epoch: 400
-  save_utd: 20
+  # [修改 3] Batch Size (4090 24G 显存极限)
+  batch_size: 224
+  epoch: 10
+  save_utd: 1
+  lora_rank: 32
+  lora_alpha: 32.0
 
 ddp:
   distributed: true
@@ -29,7 +35,7 @@ ddp:
   rank: ${oc.env:LOCAL_RANK}
   init_process_group: nccl
   addr: ${oc.env:MASTER_ADDR, localhost}
-  port: ${oc.env:MASTER:PORT, 29529}
+  port: ${oc.env:MASTER_PORT, 29529}
 
 model_type: x_start
 
@@ -39,8 +45,34 @@ defaults:
   - data/dataset: nuplan_data
   - data/input_aug: input_aug
   - normalization_stats: waypoints_norm_stats
-  - recorder: tensorboard
+  - recorder: [tensorboard, wandb]
   - optimizer: adamw
   - scheduler: warmup_const
   - ema: ema
   - _self_
+
+model:
+  model_decoder:
+    lora_configs:
+      attn:
+        _target_: flow_planner.model.model_utils.lora.LoRAConfig
+        rank: ${train.lora_rank}
+        alpha: ${train.lora_alpha}
+        init_std: 0.01
+        rslora: false
+      ffn:
+        _target_: flow_planner.model.model_utils.lora.LoRAConfig
+        rank: ${train.lora_rank}
+        alpha: ${train.lora_alpha}
+        init_std: 0.01
+        rslora: false
+
+# [修改 4] 数据路径覆盖 (利用 defaults 之后的层级覆盖特性)
+# 这样就不用去改 data/dataset/nuplan_data.yaml 原文件了
+data:
+  dataset:
+    train:
+      # 自动指向 $HOME/data/nuplan...
+      data_dir: ${oc.env:HOME}/data/nuplan/processed_data_train_pittsburgh
+      # 指向项目根目录下的 json 文件
+      data_list: ${project_root}/train_pittsburgh.json

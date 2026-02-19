@@ -30,3 +30,7 @@ class TensorboardRecorder(RecorderBase):
         if self.writer is not None:
             for key, value in metrics.items():
                 self.writer.add_scalar(key, value, step)
+            
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()

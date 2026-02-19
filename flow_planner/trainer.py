@@ -17,7 +17,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from flow_planner.train_utils import ddp
 from flow_planner.data.utils.collect import collect_batch
 from flow_planner.train_utils.ddp import reduce_and_average_losses, ddp_setup_universal
-from flow_planner.train_utils.save_model import save_model, resume_model
+# 【修改】引入 save_model_lora
+from flow_planner.train_utils.save_model import save_model_lora, resume_model
+
+# 【新增】引入 LoRA 冻结和统计工具
+from flow_planner.model.model_utils.lora import (
+    freeze_non_lora_params,
+    count_trainable_params,
+)
 
 
 def set_seed(CUR_SEED):
@@ -26,6 +33,66 @@ def set_seed(CUR_SEED):
     torch.manual_seed(CUR_SEED)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+# 【新增】从 trainer_rl.py 迁移的安全加载函数
+def load_sft_checkpoint(model, ckpt_path, logger):
+    """
+    Load pretrained SFT checkpoint into model.
+    LoRA parameters will be missing (expected) since SFT model doesn't have them.
+    """
+    logger.info(f"Loading SFT checkpoint from {ckpt_path}")
+    ckpt = torch.load(ckpt_path, weights_only=True)
+
+    pretrained_sd = {
+        n.replace("module.", ""): v for n, v in ckpt["ema_state_dict"].items()
+    }
+
+    mapped_sd = {}
+    for k, v in pretrained_sd.items():
+        if "ffn.0." in k:
+            k = k.replace("ffn.0.", "fc1.")
+        elif "ffn.3." in k:
+            k = k.replace("ffn.3.", "fc2.")
+        # FinalLayer: 旧 proj Sequential → 新拆分子模块
+        if "final_layer.proj.0." in k:
+            k = k.replace("final_layer.proj.0.", "final_layer.proj_ln1.")
+        elif "final_layer.proj.1." in k:
+            k = k.replace("final_layer.proj.1.", "final_layer.proj_fc1.")
+        elif "final_layer.proj.3." in k:
+            k = k.replace("final_layer.proj.3.", "final_layer.proj_ln2.")
+        elif "final_layer.proj.4." in k:
+            k = k.replace("final_layer.proj.4.", "final_layer.proj_fc2.")
+        # adaLN_modulation: Sequential → 拆分
+        if "final_layer.adaLN_modulation.0." in k:
+            pass  # SiLU 无参数
+        elif "final_layer.adaLN_modulation.1." in k:
+            k = k.replace("final_layer.adaLN_modulation.1.", "final_layer.adaln_linear.")
+        mapped_sd[k] = v
+
+    # strict=False 允许 LoRA 权重随机初始化而不报错
+    missing, unexpected = model.load_state_dict(mapped_sd, strict=False)
+
+    non_lora_missing = [k for k in missing if "lora" not in k.lower()]
+    if non_lora_missing:
+        logger.warning(
+            f"Non-LoRA keys missing from SFT checkpoint (possible architecture mismatch): "
+            f"{non_lora_missing}"
+        )
+
+    lora_missing = [k for k in missing if "lora" in k.lower()]
+    logger.info(
+        f"SFT checkpoint loaded. "
+        f"LoRA keys initialized randomly: {len(lora_missing)} | "
+        f"Non-LoRA missing: {len(non_lora_missing)} | "
+        f"Unexpected: {len(unexpected)}"
+    )
+
+    if unexpected:
+        logger.warning(f"Unexpected keys in SFT checkpoint: {unexpected}")
+
+    return model
+
 
 @hydra.main(version_base=None, config_path="script")
 def trainer(cfg: DictConfig):
@@ -50,10 +117,20 @@ def trainer(cfg: DictConfig):
     logger.info("build model")
     model = instantiate(cfg.model)
 
-    # load pretrain checkpoint
+    # 【修改】使用兼容 LoRA 的 checkpoint 加载方式
     if cfg.pretrained_checkpoint is not None:
-        ckpt = torch.load(cfg.pretrained_checkpoint, weights_only=True)
-        model.load_state_dict({n.split("module.")[1]: v for n, v in ckpt['ema_state_dict'].items()})
+        model = load_sft_checkpoint(model, cfg.pretrained_checkpoint, logger)
+
+    # ===================================================
+    # 【新增】冻结 Base 参数，仅开放 LoRA 进行 SFT Warm-up
+    # ===================================================
+    freeze_non_lora_params(model)
+    param_stats = count_trainable_params(model)
+    logger.info(
+        f"LoRA SFT enabled | Total params: {param_stats['total']:,} | "
+        f"Trainable params: {param_stats['trainable']:,} | "
+        f"Ratio: {param_stats['ratio']}"
+    )
 
     model = model.to(local_rank)  # Move model to the current global_rank's GPU
     if cfg.ddp.distributed:
@@ -66,8 +143,10 @@ def trainer(cfg: DictConfig):
     trainloader = DataLoader(trainset, sampler=trainsampler, batch_size=cfg.train.batch_size // world_size, num_workers=cfg.num_workers, pin_memory=cfg.pin_mem, drop_last=True, collate_fn=collect_batch)
     
     # build optimizer
-    logger.info("build optimizer")
-    optimizer = instantiate(cfg.optimizer, params=ddp.get_model(model).get_optimizer_params(), lr=cfg.optimizer.lr)
+    logger.info("build optimizer (LoRA params only)")
+    # 【修改】只把 requires_grad=True 的 LoRA 参数传给优化器
+    lora_params = [p for p in ddp.get_model(model).parameters() if p.requires_grad]
+    optimizer = instantiate(cfg.optimizer, params=[{"params": lora_params}], lr=cfg.optimizer.lr)
 
     # build scheduler
     logger.info("build scheduler")
@@ -81,15 +160,26 @@ def trainer(cfg: DictConfig):
     # TODO: modify augmentation for compatibility with AirFormerDataSample
     core = instantiate(cfg.core)
     
-    if cfg.resume_path is not None:
+    resume_path = cfg.get("resume_path", None)
+    should_resume = cfg.get("should_resume", False)
+    
+    if resume_path is None and should_resume:
+        latest_ckpt = os.path.join(cfg.save_dir, 'latest.pth')
+        if os.path.isfile(latest_ckpt):
+            resume_path = cfg.save_dir
+            logger.info(f"Resume flag is set. Auto-resuming from save_dir: {resume_path}")
+
+    if resume_path is not None:
         model, optimizer, scheduler, init_epoch, wandb_id, ema = resume_model(
-            cfg.resume_path,
+            resume_path,
             model,
             optimizer,
             scheduler,
             ema,
             cfg.device
         )
+        # 断点续训后确保冻结状态不丢失
+        freeze_non_lora_params(model)
     else:
         wandb_id = None
         init_epoch = 0
@@ -109,69 +199,100 @@ def trainer(cfg: DictConfig):
     
     timer = time.time()
 
-    with tqdm(total=cfg.train.epoch, initial=init_epoch, disable=(global_rank != 0)) as epoch_bar:
-        for epoch in range(init_epoch, cfg.train.epoch):
-            trainsampler.set_epoch(epoch)
+    try:
+        with tqdm(total=cfg.train.epoch, initial=init_epoch, disable=(global_rank != 0)) as epoch_bar:
+            for epoch in range(init_epoch, cfg.train.epoch):
+                trainsampler.set_epoch(epoch)
+                            
+                model.train()
+                
+                loss_list = []
+                
+                # Training Step
+                with tqdm(total=len(trainloader), desc=f"Epoch {epoch+1} - Training", disable=(global_rank != 0), leave=False) as batch_bar:
+                    for k, data in enumerate(trainloader):
+                        data = data.to(cfg.device)
+                        loss = core.train_step(model, data)
                         
-            model.train()
-            
-            loss_list = []
-            
-            # Training Step
-            with tqdm(total=len(trainloader), desc=f"Epoch {epoch+1} - Training", disable=(global_rank != 0), leave=False) as batch_bar:
-                for k, data in enumerate(trainloader):
-                    data = data.to(cfg.device)
-                    loss = core.train_step(model, data)
-                    
-                    optimizer.zero_grad()
-                    loss['total_loss'].backward()
+                        optimizer.zero_grad()
+                        loss['total_loss'].backward()
 
-                    nn.utils.clip_grad_norm_(ddp.get_model(model).parameters(), 5)
-                    
-                    optimizer.step()
-
-                    ema.update(model)
-
-                    loss_list.append(loss)
-
-                    tqdm_dict = {'loss' : f"{loss['total_loss'].item():.3f}"}
+                        # 【修改】裁剪梯度时，也只对参与训练的 lora_params 进行操作
+                        nn.utils.clip_grad_norm_(lora_params, 5.0)
                         
-                    batch_bar.set_postfix(tqdm_dict)
-                    batch_bar.update(1)
+                        optimizer.step()
 
-            scheduler.step()
-            
-            # record loss
-            epoch_loss = {name: ( sum([l[name] for l in loss_list]) / len(loss_list) ) for name in loss.keys()}
-            epoch_lr = {f"lr/group_{i}": param_group['lr'] for i, param_group in enumerate(optimizer.param_groups)}
-            
-            if cfg.ddp.distributed:
-                epoch_loss = reduce_and_average_losses(epoch_loss, torch.device(cfg.device))
+                        ema.update(model)
 
-            logger.info(f"epoch loss : {epoch_loss['total_loss']:.3e} | epoch_lr : {epoch_lr['lr/group_0']:.3e}")
+                        loss_list.append(loss)
 
-            if global_rank == 0:
-                for recorder in recorder_dict.values():
-                    recorder.record_loss(epoch_loss, epoch+1)
-                    recorder.record_loss(epoch_lr, epoch+1)
-                    
-            # save model
-            if global_rank == 0 and (epoch+1) % cfg.train.save_utd == 0:
-                if 'wandb' in recorder_dict.keys():
-                    wandb_id = recorder_dict['wandb'].id
-                else:
-                    wandb_id = None
-                save_model(model, optimizer, scheduler, cfg.save_dir, epoch, epoch_loss['total_loss'], wandb_id, ema.ema, save_every_epoch=cfg.save_every_since)
-                print(f"Model saved in {cfg.save_dir}\n")
-            
-            epoch_bar.update(1)
-            
-            if cfg.ddp.distributed:
-                torch.cuda.synchronize()
-            
-    logger.info(f"Training finished - Time consumed: {time.strftime('%H:%M:%S', time.gmtime(time.time()-timer))}")
-    
-    torch.distributed.destroy_process_group()
+                        tqdm_dict = {'loss' : f"{loss['total_loss'].item():.3f}"}
+                            
+                        batch_bar.set_postfix(tqdm_dict)
+                        batch_bar.update(1)
+
+                scheduler.step()
+                
+                # record loss
+                epoch_loss = {name: ( sum([l[name] for l in loss_list]) / len(loss_list) ) for name in loss.keys()}
+                epoch_lr = {f"lr/group_{i}": param_group['lr'] for i, param_group in enumerate(optimizer.param_groups)}
+                
+                if cfg.ddp.distributed:
+                    epoch_loss = reduce_and_average_losses(epoch_loss, torch.device(cfg.device))
+
+                logger.info(f"epoch loss : {epoch_loss['total_loss']:.3e} | epoch_lr : {epoch_lr['lr/group_0']:.3e}")
+
+                if global_rank == 0:
+                    for recorder in recorder_dict.values():
+                        recorder.record_loss(epoch_loss, epoch+1)
+                        recorder.record_loss(epoch_lr, epoch+1)
+                        
+                # save model
+                if global_rank == 0 and (epoch+1) % cfg.train.save_utd == 0:
+                    if 'wandb' in recorder_dict.keys():
+                        wandb_id = recorder_dict['wandb'].id
+                    else:
+                        wandb_id = None
+                        
+                    # 【修改】使用 save_model_lora 仅保存 LoRA 权重，节省磁盘空间
+                    save_model_lora(model, optimizer, scheduler, cfg.save_dir, epoch, epoch_loss['total_loss'], wandb_id, ema.ema, save_every_epoch=cfg.save_every_since)
+                    print(f"Model saved in {cfg.save_dir}\n")
+                
+                epoch_bar.update(1)
+                
+                if cfg.ddp.distributed:
+                    torch.cuda.synchronize()
+
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user (Ctrl+C). Stopping...")
+        if global_rank == 0:
+            print("\n[Force Exit] Detected Ctrl+C. Killing process immediately using os._exit to bypass WandB sync hang.")
+        os._exit(1)  
+
+    except Exception as e:
+        logger.error(f"An error occurred during training: {e}")
+        if global_rank == 0:
+            import traceback
+            traceback.print_exc()
+        os._exit(1)
+
+    finally:
+        if global_rank == 0:
+            logger.info("Closing recorders...")
+            for name, recorder in recorder_dict.items():
+                if hasattr(recorder, 'close'):
+                    try:
+                        recorder.close()
+                        logger.info(f"Recorder {name} closed.")
+                    except Exception as e:
+                        logger.error(f"Failed to close recorder {name}: {e}")
+
+        logger.info(f"Training finished - Time consumed: {time.strftime('%H:%M:%S', time.gmtime(time.time()-timer))}")
+        
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        
+        os._exit(0)
     
 if __name__ == '__main__':
     trainer()

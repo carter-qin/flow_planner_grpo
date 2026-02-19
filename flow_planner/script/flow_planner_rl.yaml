@@ -1,0 +1,85 @@
+hydra:
+  run:
+    dir: ${save_dir}
+  job:
+    name: ${job_name}
+
+project_root: ${oc.env:PROJECT_ROOT}
+save_dir: ${oc.env:SAVE_DIR}/outputs/${project}/${job_name}
+save_every_since: 50
+resume_path: null
+should_resume: true
+pretrained_checkpoint: /root/data/flow_planner_grpo/work_dirs/outputs/pittsburgh_lora/pittsburgh_run2/latest.pth
+
+# [修改 1] 项目名称
+project: pittsburgh_rl
+job_name: pittsburgh_run3
+logger_level: info
+seed: 3402
+device: cuda
+num_workers: 12
+use_wandb: true
+pin_mem: true
+
+train:
+  # [修改 3] Batch Size (4090 24G 显存极限)
+  batch_size: 120
+  epoch: 1
+  warm_up_epoch: 0
+  save_utd: 1
+  adv_clip_max: 5
+  ppo_epochs: 4
+  clip_range: 0.15 # [恢复] 回到原始值
+  beta: 0.04
+  lora_rank: 32
+  lora_alpha: 128.0
+  group_size: 8
+  rl_lr: 3e-4 # [恢复] 回到原始值
+  adv_scale: 7.0 # [恢复] 回到原始值
+  max_kl_per_iter: 0.05
+
+ddp:
+  distributed: true
+  world_size: ${oc.env:WORLD_SIZE}
+  rank: ${oc.env:LOCAL_RANK}
+  init_process_group: nccl
+  addr: ${oc.env:MASTER_ADDR, localhost}
+  port: ${oc.env:MASTER_PORT, 29529}
+
+model_type: x_start
+
+defaults:
+  - model: flow_planner
+  - core: flow_matching
+  - data/dataset: nuplan_data
+  - data/input_aug: input_aug
+  - normalization_stats: waypoints_norm_stats
+  - recorder: [tensorboard, wandb]
+  - optimizer: adamw
+  - scheduler: warmup_const
+  - ema: ema
+  - _self_
+
+model:
+  model_decoder:
+    lora_configs:
+      attn:
+        _target_: flow_planner.model.model_utils.lora.LoRAConfig
+        rank: ${train.lora_rank}
+        alpha: ${train.lora_alpha}
+        init_std: 0.01
+        rslora: false
+      ffn:
+        _target_: flow_planner.model.model_utils.lora.LoRAConfig
+        rank: ${train.lora_rank}
+        alpha: ${train.lora_alpha}
+        init_std: 0.01
+        rslora: false
+
+data:
+  dataset:
+    train:
+      # 自动指向 $HOME/data/nuplan...
+      data_dir: ${oc.env:HOME}/data/nuplan/processed_data_train_pittsburgh
+      # 指向项目根目录下的 json 文件
+      data_list: ${project_root}/train_pittsburgh.json

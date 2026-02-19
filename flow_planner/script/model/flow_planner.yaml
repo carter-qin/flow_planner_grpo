@@ -33,6 +33,15 @@ flow_ode:
   sample_method: midpoint
   sample_temperature: 1.0
 
+flow_sde:
+  _target_: flow_planner.model.flow_planner_model.flow_utils.flow_sde.FlowSDE
+  path:
+    _target_: flow_matching.path.affine.AffineProbPath
+    scheduler:
+      _target_: flow_matching.path.scheduler.CondOTScheduler
+  noise_level: 0.2
+  sample_steps: 2
+
 assemble_method: average
 
 obs_normalizer:
@@ -105,6 +114,7 @@ model_decoder:
   enable_attn_dist: true
   act_pe_type: "fixed_sin"
   device: ${device}
+  lora_configs: null
   neighbor_num: ${..neighbor_num}
   neighbor_pred_num: ${..neighbor_pred_num}
   static_num: ${..static_num}

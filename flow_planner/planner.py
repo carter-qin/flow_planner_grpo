@@ -37,6 +37,7 @@ class FlowPlanner(AbstractPlanner):
             future_trajectory_sampling: TrajectorySampling,
 
             enable_ema: bool = True,
+            enable_lora: bool = False,
             device: str = "cpu",
             use_cfg: bool = True,
             cfg_weight: float = 1.0,
@@ -51,6 +52,31 @@ class FlowPlanner(AbstractPlanner):
         
         config = omegaconf.OmegaConf.load(config_path)
         self._config = config
+
+        self._enable_lora = enable_lora
+
+        # Strip LoRA configs only when NOT using LoRA.
+        # When enable_lora=True, we keep the LoRA layers so that
+        # LoRA checkpoint weights can be loaded into them.
+        if not enable_lora:
+            with omegaconf.open_dict(config):
+                if "model" in config:
+                    # decoder-level lora_configs
+                    if "model_decoder" in config.model and "lora_configs" in config.model.model_decoder:
+                        config.model.model_decoder.lora_configs = None
+                    # Also handle any nested lora_config keys
+                    def _strip_lora(cfg):
+                        if isinstance(cfg, omegaconf.DictConfig):
+                            for key in list(cfg.keys()):
+                                if key in ("lora_config", "lora_configs"):
+                                    cfg[key] = None
+                                else:
+                                    _strip_lora(cfg[key])
+                        elif isinstance(cfg, omegaconf.ListConfig):
+                            for item in cfg:
+                                _strip_lora(item)
+                    _strip_lora(config.model)
+
         self._ckpt_path = ckpt_path
 
         self._past_trajectory_sampling = past_trajectory_sampling
@@ -89,19 +115,82 @@ class FlowPlanner(AbstractPlanner):
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
         if self._ckpt_path is not None:
-            state_dict = torch.load(self._ckpt_path, weights_only=True, map_location=self._device)
-            
-            if self._ema_enabled:
-                state_dict = state_dict['ema_state_dict']
+            ckpt = torch.load(self._ckpt_path, map_location="cpu", weights_only=False)
+
+            # Determine which state_dict to use:
+            # 1. EMA weights (preferred for inference)
+            # 2. Model weights as fallback
+            if self._ema_enabled and "ema_state_dict" in ckpt:
+                raw_sd = ckpt["ema_state_dict"]
+            elif "model" in ckpt:
+                raw_sd = ckpt["model"]
             else:
-                if "model" in state_dict.keys():
-                    state_dict = state_dict['model']
-            # use for ddp
-            model_state_dict = {k[len("module."):]: v for k, v in state_dict.items() if k.startswith("module.")}
-            self._planner.load_state_dict(model_state_dict)
+                # Legacy format: ckpt itself is the state_dict
+                raw_sd = ckpt
+
+            # Strip DDP "module." prefix if present
+            model_state_dict = {
+                k.replace("module.", "", 1): v for k, v in raw_sd.items()
+            }
+
+            if self._enable_lora:
+                # LoRA mode: load base weights first with strict=False (LoRA params will be missing),
+                # then overlay LoRA weights from the checkpoint.
+                
+                # Separate base weights and LoRA weights from checkpoint
+                lora_weights = {k: v for k, v in model_state_dict.items() if "lora" in k.lower()}
+                base_weights = {k: v for k, v in model_state_dict.items() if "lora" not in k.lower()}
+                
+                # Load base weights (LoRA params in model will keep their init values)
+                missing_base, unexpected_base = self._planner.load_state_dict(base_weights, strict=False)
+                
+                # Filter out expected LoRA missing keys
+                non_lora_missing = [k for k in missing_base if "lora" not in k.lower()]
+                if non_lora_missing:
+                    print(f"[WARNING] Non-LoRA missing keys ({len(non_lora_missing)}): {non_lora_missing[:10]}")
+                if unexpected_base:
+                    print(f"[WARNING] Unexpected keys from base weights ({len(unexpected_base)}): {unexpected_base[:10]}")
+                
+                # Now load LoRA weights if present in checkpoint
+                if lora_weights:
+                    lora_missing, lora_unexpected = self._planner.load_state_dict(
+                        lora_weights, strict=False
+                    )
+                    # lora_missing will contain ALL non-lora keys (expected)
+                    actual_lora_missing = [k for k in lora_missing if "lora" in k.lower()]
+                    if actual_lora_missing:
+                        print(f"[WARNING] LoRA keys in model but NOT in checkpoint ({len(actual_lora_missing)}): {actual_lora_missing[:10]}")
+                    print(f"LoRA checkpoint loaded. LoRA weights loaded: {len(lora_weights)} | LoRA missing in ckpt: {len(actual_lora_missing)}")
+                else:
+                    print("[INFO] No LoRA weights found in checkpoint. LoRA layers use random initialization (likely an SFT checkpoint).")
+                
+                # Also try loading LoRA-only state dict if saved separately
+                if "lora_state_dict" in ckpt and ckpt["lora_state_dict"]:
+                    lora_only_sd = ckpt["lora_state_dict"]
+                    lora_only_sd = {k.replace("module.", "", 1): v for k, v in lora_only_sd.items()}
+                    lm, lu = self._planner.load_state_dict(lora_only_sd, strict=False)
+                    actual_lora_loaded = len(lora_only_sd) - len([k for k in lu if "lora" in k.lower()])
+                    print(f"[INFO] Also loaded lora_state_dict key: {len(lora_only_sd)} entries")
+            else:
+                # Non-LoRA mode: original loading logic
+                missing, unexpected = self._planner.load_state_dict(model_state_dict, strict=False)
+
+                non_lora_missing = [k for k in missing if "lora" not in k.lower()]
+                if non_lora_missing:
+                    print(f"[WARNING] Non-LoRA missing keys ({len(non_lora_missing)}): {non_lora_missing[:10]}")
+                if unexpected:
+                    print(f"[WARNING] Unexpected keys ({len(unexpected)}): {unexpected[:10]}")
+
+                lora_missing = [k for k in missing if "lora" in k.lower()]
+                print(
+                    f"Checkpoint loaded. "
+                    f"LoRA missing (expected if merged): {len(lora_missing)} | "
+                    f"Non-LoRA missing: {len(non_lora_missing)} | "
+                    f"Unexpected: {len(unexpected)}"
+                )
         else:
-            print("load random model")
-        
+            print("[WARNING] No checkpoint path provided, using random weights.")
+
         self._planner.eval()
         self._planner = self._planner.to(self._device)
         self._initialization = initialization

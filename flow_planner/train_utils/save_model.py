@@ -22,6 +22,33 @@ def save_model(model, optimizer, scheduler, save_path, epoch, train_loss, wandb_
         with open(f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth', "wb") as f:
             torch.save(save_ckpt, f)
 
+
+def save_model_lora(model, optimizer, scheduler, save_path, epoch, train_loss, wandb_id, ema, save_every_epoch=200):
+    """
+    Save model for LoRA training: save full state_dict (base + LoRA) + LoRA-only state_dict.
+    """
+    # Extract LoRA-only weights for lightweight saving
+    full_sd = model.state_dict()
+    lora_sd = {k: v for k, v in full_sd.items() if 'lora' in k.lower()}
+    
+    save_ckpt = {
+        'epoch': epoch + 1, 
+        'model': full_sd, 
+        'lora_state_dict': lora_sd,  # LoRA-only for quick inspection
+        'ema_state_dict': ema.state_dict(),
+        'optimizer': optimizer.state_dict(), 
+        'schedule': scheduler.state_dict(), 
+        'loss': train_loss,
+        'wandb_id': wandb_id
+    }
+    
+    torch.save(save_ckpt, f"{save_path}/latest.pth")
+
+    if epoch+1 >= save_every_epoch:
+        with open(f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth', "wb") as f:
+            torch.save(save_ckpt, f)
+
+
 def load_model(path: str):
     """
     load ckpt from path
@@ -42,7 +69,13 @@ def resume_model(path: str, model, optimizer, scheduler, ema, device):
     try:
         model.load_state_dict(ckpt['model'])
     except:
-        model.load_state_dict({n.split("module.")[1]: v for n, v in ckpt.items()})
+        # Try stripping "module." prefix from DDP
+        try:
+            model.load_state_dict({k.replace("module.", ""): v for k, v in ckpt['model'].items()})
+        except:
+            # For LoRA resume: strict=False allows missing/extra keys
+            missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+            print(f"Resume with strict=False. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
     print("Model load done")
     
     # load optimizer

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 import torch.nn as nn
 from timm.layers import Mlp
@@ -5,6 +6,7 @@ from flow_planner.model.modules.decoder_modules import FinalLayer, PostFusion
 from flow_planner.model.model_utils.tool_func import sinusoidal_positional_encoding
 from flow_planner.model.modules.decoder_modules import RMSNorm, FeedForward, AdaptiveLayerNorm
 from flow_planner.model.flow_planner_model.global_attention import JointAttention
+import flow_planner.model.model_utils.lora as lora
 
 
 class FlowPlannerDecoder(nn.Module):
@@ -20,8 +22,15 @@ class FlowPlannerDecoder(nn.Module):
             enable_attn_dist=False,
             act_pe_type: str = 'learnable',
             device: str = 'cuda',
+            lora_configs: dict[str, lora.LoRAConfig] | None = None,
             **planner_params
     ):
+        """
+        Args:
+            lora_configs: dict with optional keys "attn" and/or "ffn", each mapping to a LoRAConfig.
+                          e.g. {"attn": LoRAConfig(rank=16, alpha=16.0), "ffn": LoRAConfig(rank=16, alpha=16.0)}
+                          Pass None or {} to disable LoRA entirely.
+        """
         super().__init__()
         
         self.hidden_dim = hidden_dim
@@ -32,6 +41,7 @@ class FlowPlannerDecoder(nn.Module):
         self.action_len = planner_params['action_len']
         self.action_overlap = planner_params['action_overlap']
         self.state_dim = planner_params['state_dim']
+        self.lora_configs = lora_configs or {}
         
         self.dit = FlowPlannerDiT(
             depth=depth,
@@ -44,13 +54,14 @@ class FlowPlannerDecoder(nn.Module):
             heads=heads,
             dim_head=int(hidden_dim/heads),
             enable_attn_dist=enable_attn_dist,
-            token_num=self.token_num
+            token_num=self.token_num,
+            lora_configs=self.lora_configs,
         )
         
         self.post_fusion = PostFusion(hidden_dim=hidden_dim, heads=heads, action_num=self.action_num)
         self.t_embedder = t_embedder        
         self.preproj = Mlp(in_features=self.output_dim, hidden_features=preproj_hidden, out_features=hidden_dim, act_layer=nn.GELU, drop=0.)
-        self.final_layer = FinalLayer(hidden_dim, self.output_dim)
+        self.final_layer = FinalLayer(hidden_dim, self.output_dim, lora_config=self.lora_configs.get("ffn"))
 
         self.cfg_embedding = nn.Embedding(2, hidden_dim) # an embedding that indicates if the neighbor vehicles are dropped
         self.act_pe_type = act_pe_type
@@ -170,10 +181,12 @@ class FlowPlannerDiTBlock(nn.Module):
         enable_attn_dist = False,
         ff_kwargs: dict = dict(),
         token_num: int = 118,
+        lora_configs: dict[str, lora.LoRAConfig] | None = None,
     ):
         super().__init__()
         self.num_modalities = len(dim_modalities)
         self.dim_modalities = dim_modalities
+        lora_configs = lora_configs or {}
 
         self.modalities_gate_proj = nn.ModuleList([
             nn.Sequential(
@@ -193,11 +206,15 @@ class FlowPlannerDiTBlock(nn.Module):
             dim_head = dim_head,
             heads = heads,
             enable_attn_dist = enable_attn_dist,
-            token_num=token_num
+            token_num=token_num,
+            lora_config=lora_configs.get("attn"),
         )
 
         self.ff_layernorms = nn.ModuleList([AdaptiveLayerNorm(dim, dim_cond = dim_cond) for dim in dim_modalities])
-        self.feedforwards = nn.ModuleList([FeedForward(dim, **ff_kwargs) for dim in dim_modalities])
+        self.feedforwards = nn.ModuleList([
+            FeedForward(dim, lora_config=lora_configs.get("ffn"), **ff_kwargs)
+            for dim in dim_modalities
+        ])
 
     def forward(
         self,
@@ -238,11 +255,17 @@ class FlowPlannerDiT(nn.Module):
         depth,
         dim_modalities,
         enable_attn_dist = False,
+        lora_configs: dict[str, lora.LoRAConfig] | None = None,
         **block_kwargs
     ):
         super().__init__()
 
-        blocks = [FlowPlannerDiTBlock(dim_modalities = dim_modalities, enable_attn_dist = enable_attn_dist, **block_kwargs) for _ in range(depth)]
+        blocks = [FlowPlannerDiTBlock(
+            dim_modalities = dim_modalities,
+            enable_attn_dist = enable_attn_dist,
+            lora_configs=lora_configs,
+            **block_kwargs,
+        ) for _ in range(depth)]
         self.blocks = nn.ModuleList(blocks)
 
         norms = [RMSNorm(dim) for dim in dim_modalities]

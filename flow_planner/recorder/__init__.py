@@ -8,3 +8,6 @@ class RecorderBase:
     @abstractmethod
     def record_metric(self, metrics):
         raise NotImplementedError
+    
+    def close(self):
+        pass

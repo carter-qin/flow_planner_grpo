@@ -1,0 +1,9 @@
+wandb:
+  _target_: flow_planner.recorder.wandb.WandbRecorder
+  project: "FlowPlanner"
+  name: ${job_name}
+  dir: ${oc.env:SAVE_DIR}
+  mode: "online" # 或 disabled, offline
+  resume: "allow"
+  config: 
+    train: ${train}
